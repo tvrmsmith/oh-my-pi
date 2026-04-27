@@ -533,3 +533,132 @@ describe("discoverAgents plugin precedence", () => {
 		expect(found?.filePath).toContain(projectPluginPath);
 	});
 });
+
+describe("listClaudePluginRoots — enabledPlugins overrides", () => {
+	let tempDir: string;
+	let projectDir: string;
+	let originalHome: string | undefined;
+
+	const writeRegistry = async (pluginId: string, installPath: string): Promise<void> => {
+		const pluginsDir = path.join(tempDir, ".claude", "plugins");
+		await fs.mkdir(pluginsDir, { recursive: true });
+		const registry = {
+			version: 2,
+			plugins: {
+				[pluginId]: [
+					{
+						scope: "user",
+						installPath,
+						version: "1.0.0",
+						installedAt: "2025-01-01T00:00:00Z",
+						lastUpdated: "2025-01-01T00:00:00Z",
+					},
+				],
+			},
+		};
+		await fs.writeFile(path.join(pluginsDir, "installed_plugins.json"), JSON.stringify(registry));
+	};
+
+	const writeUserSettings = async (enabledPlugins: Record<string, boolean>): Promise<void> => {
+		const settingsDir = path.join(tempDir, ".claude");
+		await fs.mkdir(settingsDir, { recursive: true });
+		await fs.writeFile(path.join(settingsDir, "settings.json"), JSON.stringify({ enabledPlugins }));
+	};
+
+	const writeProjectSettings = async (
+		file: "settings.json" | "settings.local.json",
+		enabledPlugins: Record<string, boolean>,
+	): Promise<void> => {
+		const settingsDir = path.join(projectDir, ".claude");
+		await fs.mkdir(settingsDir, { recursive: true });
+		await fs.writeFile(path.join(settingsDir, file), JSON.stringify({ enabledPlugins }));
+	};
+
+	beforeEach(async () => {
+		clearClaudePluginRootsCache();
+		clearFsCache();
+		originalHome = process.env.HOME;
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "claude-plugins-overrides-"));
+		projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "claude-plugins-project-"));
+		process.env.HOME = tempDir;
+		vi.spyOn(os, "homedir").mockReturnValue(tempDir);
+	});
+
+	afterEach(async () => {
+		clearClaudePluginRootsCache();
+		clearFsCache();
+		vi.restoreAllMocks();
+		if (originalHome === undefined) {
+			delete process.env.HOME;
+		} else {
+			process.env.HOME = originalHome;
+		}
+		await fs.rm(tempDir, { recursive: true, force: true });
+		await fs.rm(projectDir, { recursive: true, force: true });
+	});
+
+	test("user settings.json enabledPlugins:false hides plugin", async () => {
+		await writeRegistry("silenced@market", "/path/to/silenced");
+		await writeUserSettings({ "silenced@market": false });
+
+		const result = await listClaudePluginRoots(tempDir, projectDir);
+		expect(result.roots).toHaveLength(0);
+	});
+
+	test("missing entry leaves plugin enabled (default-on)", async () => {
+		await writeRegistry("untouched@market", "/path/to/untouched");
+		await writeUserSettings({ "other-plugin@market": false });
+
+		const result = await listClaudePluginRoots(tempDir, projectDir);
+		expect(result.roots).toHaveLength(1);
+		expect(result.roots[0].id).toBe("untouched@market");
+	});
+
+	test("true entry leaves plugin enabled (no-op override)", async () => {
+		await writeRegistry("explicit@market", "/path/to/explicit");
+		await writeUserSettings({ "explicit@market": true });
+
+		const result = await listClaudePluginRoots(tempDir, projectDir);
+		expect(result.roots).toHaveLength(1);
+	});
+
+	test("project settings.json re-enables plugin disabled at user scope", async () => {
+		await writeRegistry("flippable@market", "/path/to/flippable");
+		await writeUserSettings({ "flippable@market": false });
+		await writeProjectSettings("settings.json", { "flippable@market": true });
+
+		const result = await listClaudePluginRoots(tempDir, projectDir);
+		expect(result.roots).toHaveLength(1);
+		expect(result.roots[0].id).toBe("flippable@market");
+	});
+
+	test("project settings.local.json overrides project settings.json", async () => {
+		await writeRegistry("layered@market", "/path/to/layered");
+		await writeProjectSettings("settings.json", { "layered@market": true });
+		await writeProjectSettings("settings.local.json", { "layered@market": false });
+
+		const result = await listClaudePluginRoots(tempDir, projectDir);
+		expect(result.roots).toHaveLength(0);
+	});
+
+	test("malformed enabledPlugins value is ignored", async () => {
+		await writeRegistry("resilient@market", "/path/to/resilient");
+		const settingsDir = path.join(tempDir, ".claude");
+		await fs.mkdir(settingsDir, { recursive: true });
+		await fs.writeFile(
+			path.join(settingsDir, "settings.json"),
+			JSON.stringify({ enabledPlugins: { "resilient@market": "yes" } }),
+		);
+
+		const result = await listClaudePluginRoots(tempDir, projectDir);
+		expect(result.roots).toHaveLength(1);
+	});
+
+	test("missing settings file is silently tolerated", async () => {
+		await writeRegistry("safe@market", "/path/to/safe");
+
+		const result = await listClaudePluginRoots(tempDir, projectDir);
+		expect(result.roots).toHaveLength(1);
+		expect(result.warnings).toEqual([]);
+	});
+});
