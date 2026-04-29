@@ -292,34 +292,40 @@ export class ProcessTerminal implements Terminal {
 				}
 			}
 
-			// DA1 response: swallow our sentinel reply regardless of whether OSC 11
-			// already succeeded. Other terminal probes should never see these replies.
-			if (da1ResponsePattern.test(sequence) && this.#pendingDa1Sentinels > 0) {
-				this.#pendingDa1Sentinels--;
-				if (this.#osc11Pending) {
-					// DA1 arrived before OSC 11 response: terminal does not support
-					// OSC 11. Clear the pending state without starting a queued query
-					// (queued query is started below, after sentinel is consumed).
-					this.#osc11Pending = false;
-					this.#osc11ResponseBuffer = "";
-				}
-				// Now that this DA1 cycle is complete, start any queued query.
-				if (this.#osc11QueryQueued && !this.#dead) {
-					this.#osc11QueryQueued = false;
-					this.#startOsc11Query();
+			// DA1 response: swallow our sentinel reply unconditionally. Any `\x1b[?...c`
+			// arriving on stdin is the host terminal answering our probe (or another
+			// background tool's probe) and is never legitimate user input — forwarding
+			// it to the focused component leaks into nested PTYs (e.g. interactive CLI prompts).
+			if (da1ResponsePattern.test(sequence)) {
+				if (this.#pendingDa1Sentinels > 0) {
+					this.#pendingDa1Sentinels--;
+					if (this.#osc11Pending) {
+						// DA1 arrived before OSC 11 response: terminal does not support
+						// OSC 11. Clear the pending state without starting a queued query
+						// (queued query is started below, after sentinel is consumed).
+						this.#osc11Pending = false;
+						this.#osc11ResponseBuffer = "";
+					}
+					// Now that this DA1 cycle is complete, start any queued query.
+					if (this.#osc11QueryQueued && !this.#dead) {
+						this.#osc11QueryQueued = false;
+						this.#startOsc11Query();
+					}
 				}
 				return;
 			}
 
-			// OSC 11 replies can be split if the stdin buffer flushes a partial sequence.
-			// Accumulate fragments until the BEL/ST terminator arrives, then parse once.
-			// If a new escape sequence arrives (not the ST terminator), abort buffering
-			// and forward it as normal input so user keystrokes are never swallowed.
-			if (this.#osc11Pending && (this.#osc11ResponseBuffer || sequence.startsWith("\x1b]11;"))) {
+			// OSC 11 replies can be split across multiple stdin events. Accumulate
+			// fragments until the BEL/ST terminator arrives, then parse once.
+			// Swallow unconditionally — `\x1b]11;rgb:...` and its continuation bytes
+			// are never user input. Gating on `#osc11Pending` was racy: a DA1 reply
+			// could clear the pending flag while the OSC 11 reply was still in flight,
+			// allowing the OSC 11 fragment to leak into the focused component.
+			if (this.#osc11ResponseBuffer || sequence.startsWith("\x1b]11;")) {
 				if (this.#osc11ResponseBuffer && sequence.startsWith("\x1b") && sequence !== "\x1b\\") {
 					// New escape sequence arrived mid-buffer — not an OSC 11 continuation.
 					this.#osc11ResponseBuffer = "";
-					// Fall through to normal input handling below.
+					// Fall through to normal input handling so user keystrokes are not swallowed.
 				} else {
 					this.#osc11ResponseBuffer += sequence;
 					const osc11Match = this.#osc11ResponseBuffer.match(osc11ResponsePattern);
