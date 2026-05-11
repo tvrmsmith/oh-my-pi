@@ -674,6 +674,50 @@ export function parseClaudePluginsRegistry(content: string): ClaudePluginsRegist
 }
 
 /**
+ * Read `enabledPlugins` from a single Claude settings JSON file.
+ * Returns the map directly (no validation beyond shape). Missing file or
+ * malformed JSON yields an empty object — never throws.
+ */
+async function readEnabledPluginsFrom(settingsPath: string): Promise<Record<string, boolean>> {
+	const content = await readFile(settingsPath);
+	if (!content) return {};
+	const data = tryParseJson<{ enabledPlugins?: unknown }>(content);
+	const raw = data?.enabledPlugins;
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+	const out: Record<string, boolean> = {};
+	for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+		if (typeof value === "boolean") out[key] = value;
+	}
+	return out;
+}
+
+/**
+ * Build the layered `enabledPlugins` map for a given home/cwd, matching
+ * Claude Code's settings precedence:
+ *   user (~/.claude/settings.json)
+ *   < project shared (<cwd>/.claude/settings.json)
+ *   < project local   (<cwd>/.claude/settings.local.json)
+ *
+ * Later layers override earlier ones. A missing entry is `undefined`,
+ * which leaves the plugin's default-enabled state intact.
+ */
+export async function loadEnabledPluginsOverrides(home: string, cwd?: string): Promise<Record<string, boolean>> {
+	const layers: Record<string, boolean>[] = [
+		await readEnabledPluginsFrom(path.join(home, ".claude", "settings.json")),
+	];
+	if (cwd) {
+		const resolvedCwd = path.resolve(cwd);
+		if (resolvedCwd !== path.resolve(home)) {
+			layers.push(
+				await readEnabledPluginsFrom(path.join(resolvedCwd, ".claude", "settings.json")),
+				await readEnabledPluginsFrom(path.join(resolvedCwd, ".claude", "settings.local.json")),
+			);
+		}
+	}
+	return Object.assign({}, ...layers);
+}
+
+/**
  * Resolve the active project registry path by walking up from `cwd`.
  *
  * Walk order:
@@ -757,7 +801,7 @@ export async function listClaudePluginRoots(
 	cwd?: string,
 ): Promise<{ roots: ClaudePluginRoot[]; warnings: string[] }> {
 	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd) : null;
-	const cacheKey = `${home}:${resolvedProjectPath ?? ""}`;
+	const cacheKey = `${home}:${cwd ? path.resolve(cwd) : ""}:${resolvedProjectPath ?? ""}`;
 	const cached = pluginRootsCache.get(cacheKey);
 	if (cached) return cached;
 
@@ -906,6 +950,16 @@ export async function listClaudePluginRoots(
 		roots.push(...projectRoots, ...deduped);
 	}
 
+	// Apply Claude `enabledPlugins` settings overrides (user + project layered).
+	// Explicit `false` removes the plugin; `true` or absence keeps it (matching
+	// Claude Code semantics). Applied before --plugin-dir injection so CLI wins.
+	const overrides = await loadEnabledPluginsOverrides(home, cwd);
+	if (Object.keys(overrides).length > 0) {
+		const filtered = roots.filter(r => overrides[r.id] !== false);
+		roots.length = 0;
+		roots.push(...filtered);
+	}
+
 	// Merge --plugin-dir roots (highest precedence) on every fresh load
 	if (injectedPluginDirRoots.length > 0) {
 		const injectedIds = new Set(injectedPluginDirRoots.map(r => r.id));
@@ -938,6 +992,7 @@ export function clearClaudePluginRootsCache(): void {
  */
 export function clearPluginRootsAndCaches(extraPaths?: readonly string[]): void {
 	invalidateFsCache(path.join(os.homedir(), ".claude", "plugins", "installed_plugins.json"));
+	invalidateFsCache(path.join(os.homedir(), ".claude", "settings.json"));
 	invalidateFsCache(path.join(getPluginsDir(), "installed_plugins.json"));
 	for (const p of extraPaths ?? []) invalidateFsCache(p);
 	clearClaudePluginRootsCache();
