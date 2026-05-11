@@ -275,4 +275,42 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 
 		terminal.stop();
 	});
+	it("unsolicited DA1 reply (e.g. host terminal answering another tool's probe) is not forwarded as input", () => {
+		vi.useFakeTimers();
+		const { terminal, received } = setupTerminal();
+
+		// Drain the initial OSC 11 + DA1 cycle so #pendingDa1Sentinels === 0.
+		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+		process.stdin.emit("data", "\x1b[?1;2c");
+		expect(received).toEqual([]);
+
+		// Now an unsolicited DA1 arrives (host terminal echoing a probe response
+		// from another concurrent tool — e.g. a nested PTY queried it).
+		process.stdin.emit("data", "\x1b[?62;4;9;22c");
+		vi.advanceTimersByTime(50);
+
+		// Must NOT leak to the focused component, otherwise it gets forwarded
+		// into nested PTYs as keystrokes (broke interactive CLI line-editing prompts).
+		expect(received).toEqual([]);
+
+		terminal.stop();
+	});
+
+	it("unsolicited OSC 11 reply is not forwarded as input", () => {
+		vi.useFakeTimers();
+		const { terminal, received } = setupTerminal();
+
+		// Drain initial cycle.
+		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+		process.stdin.emit("data", "\x1b[?1;2c");
+		expect(received).toEqual([]);
+
+		// Unsolicited OSC 11 reply (e.g. terminal pushed it after a SIGWINCH).
+		process.stdin.emit("data", "\x1b]11;rgb:0c0c/0e0e/1414\x07");
+		vi.advanceTimersByTime(50);
+
+		expect(received).toEqual([]);
+
+		terminal.stop();
+	});
 });
